@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
-from .engine import analyze, solve_inverse
+from .engine import analyze, rename_recipe, solve_inverse
 from .units import catalog
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,6 +61,21 @@ def solve(req: SolveRequest) -> dict:
     return solve_inverse(
         req.expression, req.variables, req.solve_for, req.solve_unit,
         req.lower, req.upper, req.target,
+    )
+
+
+class RenameRequest(BaseModel):
+    expression: str = ""
+    variables: dict[str, str] = {}
+    uncertainties: dict[str, str] = {}
+    renames: dict[str, str]
+
+
+@app.post("/api/rename")
+def rename(req: RenameRequest) -> dict:
+    """变量改名预览：按“旧名→新名”映射整体改写配方，并返回改名后的完整校验结果。"""
+    return rename_recipe(
+        req.expression, req.variables, req.uncertainties, req.renames,
     )
 
 

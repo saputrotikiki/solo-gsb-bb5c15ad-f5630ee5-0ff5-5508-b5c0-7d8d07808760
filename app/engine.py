@@ -8,11 +8,14 @@
   - 全角/符号运算符：× ÷ · −
   - 函数调用：sqrt / abs / sin / cos / tan / asin / acos / atan / exp / ln / log / log2
   - 变量引用（变量值本身也是带单位的表达式，可相互引用，检测循环）
+  - 反求：solve_inverse 以二分法反解直接输入变量
+  - 改名：rename_recipe 按“旧名→新名”映射整体改写配方（只改写用户变量标识符）
 
 所有错误都携带 (start, end) 片段位置，指回原始表达式字符串。
 """
 from __future__ import annotations
 
+import bisect
 import math
 import re
 from dataclasses import dataclass, field
@@ -1168,3 +1171,231 @@ def solve_inverse(expression: str, variables: dict | None, solve_for: str,
         f"二分 {SOLVE_MAX_ITERATIONS} 次后仍未达到收敛容差（SI 残差须 ≤ {tol:g}）",
         0, max(len(solve_unit), 1), "solve_max_iter",
     )
+
+
+# ---------------------------------------------------------------------------
+# 变量改名（rename）：按“旧名→新名”映射整体改写配方并预览
+# ---------------------------------------------------------------------------
+
+def _rename_rejected(errors: list[AnalysisError], warnings: list | None = None) -> dict:
+    """改名被拒绝：不产生任何可用配方，结果一律为 null。"""
+    return {"ok": False, "errors": [e.to_dict() for e in errors],
+            "warnings": warnings or [], "result": None}
+
+
+def _valid_identifier(name: str) -> bool:
+    """名称是否符合现有变量标识符规则（与词法分析的 ident 完全同口径）。
+
+    必须恰好词法分析为一个 ident token：字母 / ``_`` / ``°`` / ``%`` 起始，
+    后续为字母数字 / ``_``；不允许空白、数字开头、上标或其他字符。
+    """
+    if not name:
+        return False
+    try:
+        toks = tokenize(name)
+    except EngineError:
+        return False
+    return len(toks) == 2 and toks[0].kind == "ident" and toks[0].text == name
+
+
+def _iter_name_nodes(node: Node):
+    """遍历 AST，逐个产出 ``name`` 节点（``call`` 的函数名节点不在 args 中，自动排除）。"""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.kind == "name":
+            yield n
+        if n.left is not None:
+            stack.append(n.left)
+        if n.right is not None:
+            stack.append(n.right)
+        stack.extend(n.args)
+
+
+def _apply_edits(src: str, edits: list[tuple[int, int, str]]):
+    """按互斥片段替换改写源码，返回 (新源码, (start, end, delta) 列表)。
+
+    delta 为“替换点之后”的位置相对原串的偏移；非重叠片段按起点排序后顺序拼接。
+    """
+    edits = sorted(edits, key=lambda e: e[0])
+    parts: list[str] = []
+    records: list[tuple[int, int, int]] = []
+    cursor = 0
+    for start, end, new_text in edits:
+        parts.append(src[cursor:start])
+        parts.append(new_text)
+        records.append((start, end, len(new_text) - (end - start)))
+        cursor = end
+    parts.append(src[cursor:])
+    return "".join(parts), records
+
+
+def _shift_span(start: int, end: int, records: list[tuple[int, int, int]]) -> tuple[int, int]:
+    """把原串片段平移到改写后串中的片段（冲突片段不与任何改名编辑相交）。"""
+    ds = records[bisect.bisect_left(records, (start, 10**9, 0)) - 1][2] if records else 0
+    de = records[bisect.bisect_left(records, (end, 10**9, 0)) - 1][2] if records else 0
+    return start + ds, end + de
+
+
+def rename_recipe(expression: str, variables: dict | None,
+                  uncertainties: dict | None, renames: dict | None) -> dict:
+    """按“旧名→新名”映射同时改名，返回改写后的完整配方与改名后的校验预览。
+
+    - 映射按原名称同时生效，允许两个变量交换名称（A→B、B→A）；
+    - 只改写指向用户变量的标识符，内置单位 / 常量 / 函数调用同名文本保持原义；
+    - 若新名会遮蔽未改写的内置单位 / 常量引用，拒绝整次改名（可定位到冲突位置）；
+    - 不确定度仅随变量名迁移其键，不确定度取值文本一字不动；
+    - 改名前配方无效或改名后校验失败都不产生可用结果。
+    """
+    expression = expression or ""
+    variables = {
+        str(k).strip(): (v if isinstance(v, str) else str(v))
+        for k, v in (variables or {}).items() if str(k).strip()
+    }
+    uncertainties = {
+        str(k).strip(): (v if isinstance(v, str) else str(v)).strip()
+        for k, v in (uncertainties or {}).items()
+        if str(k).strip() and (v if isinstance(v, str) else str(v)).strip()
+    }
+    renames = {
+        str(k).strip(): (v if isinstance(v, str) else str(v))
+        for k, v in (renames or {}).items() if str(k).strip()
+    }
+
+    # ---- 1. 改名前：原配方必须完全有效（完整沿用现有校验口径） ----------------
+    before = analyze(expression, variables, None, uncertainties)
+    if not before["ok"]:
+        for err in before["errors"]:
+            err["stage"] = "before_rename"
+        return {"ok": False, "errors": before["errors"],
+                "warnings": before["warnings"], "result": None}
+
+    errors: list[AnalysisError] = []
+
+    # ---- 2. 映射检查：旧名须存在、新名须合法、最终名称不得重复 ---------------
+    mapping: dict[str, str] = {}
+    for old, new in renames.items():
+        if old not in variables:
+            errors.append(AnalysisError(
+                f"改名映射中的旧名「{old}」不是当前配方已定义的变量",
+                0, max(len(old), 1), "rename_missing_old", f"rename:{old}",
+                extra={"old": old},
+            ))
+            continue
+        if new != new.strip() or not _valid_identifier(new):
+            errors.append(AnalysisError(
+                f"变量「{old}」的新名称「{new}」不符合变量标识符规则"
+                "（须以字母、_、° 或 % 起始，后续只含字母、数字与下划线，且不含空白）",
+                0, max(len(new), 1), "rename_bad_new", f"rename:{old}",
+                extra={"old": old, "new": new},
+            ))
+            continue
+        mapping[old] = new
+
+    final_names: dict[str, str] = {}
+    for name in variables:
+        final_names[name] = mapping.get(name, name)
+    seen_new: dict[str, str] = {}
+    for old, new in final_names.items():
+        if new in seen_new:
+            errors.append(AnalysisError(
+                f"改名后变量名「{new}」重复（来自旧名「{seen_new[new]}」与「{old}」）",
+                0, max(len(new), 1), "rename_duplicate", f"rename:{old}",
+                extra={"new": new, "old": old, "conflicts_with": seen_new[new]},
+            ))
+        else:
+            seen_new[new] = old
+    if errors:
+        return _rename_rejected(errors, before["warnings"])
+
+    # ---- 3. AST 扫描：收集用户变量改名编辑，并检测对内置单位/常量的遮蔽冲突 ----
+    final_set = set(final_names.values())
+
+    def builtin_kind(name: str) -> str | None:
+        if name in CONSTANTS:
+            return "constant"
+        if name in UNITS:
+            return "unit"
+        return None
+
+    def scan(src: str, edits_out: list, conflicts: list,
+             owner: str, for_uncertainty: bool) -> None:
+        try:
+            ast = parse_src(src)
+        except EngineError:
+            return  # 改名前 analyze 已保证可解析，这里防御性跳过
+        for node in _iter_name_nodes(ast):
+            if not for_uncertainty and node.name in variables:
+                # 仅改写指向用户变量的引用（名称解析顺序：用户变量 > 内置）
+                edits_out.append((node.start, node.end, final_names[node.name]))
+                continue
+            kind = builtin_kind(node.name)
+            if kind is not None and node.name in final_set:
+                conflicts.append((node, kind))
+
+    sources = [("expression", expression, False)]
+    for name, src in variables.items():
+        sources.append((f"var:{name}", src, False))
+    for name, src in uncertainties.items():
+        sources.append((f"uncert:{name}", src, True))
+
+    scanned: list[tuple[str, str, list, list]] = []
+    for source, src, is_uncert in sources:
+        edits: list = []
+        conflicts: list = []
+        scan(src, edits, conflicts, source, is_uncert)
+        scanned.append((source, src, edits, conflicts))
+
+    for source, src, edits, conflicts in scanned:
+        _, records = _apply_edits(src, edits)
+        for node, kind in conflicts:
+            start, end = _shift_span(node.start, node.end, records)
+            what = "内置常量" if kind == "constant" else "内置单位"
+            if source == "expression":
+                where = "主表达式"
+            elif source.startswith("uncert:"):
+                where = f"变量「{source[len('uncert:'):]}」的不确定度"
+            else:
+                where = f"变量「{source[len('var:'):]}」的定义式"
+            errors.append(AnalysisError(
+                f"{where}中的{what}「{node.name}」会被改名后的同名变量遮蔽，"
+                f"该处本应指向{what}，改名将改变配方含义；请更换新变量名",
+                start, max(end, start + 1), "rename_shadow", source,
+                extra={"shadowed": node.name, "builtin_kind": kind},
+            ))
+    if errors:
+        return _rename_rejected(errors, before["warnings"])
+
+    # ---- 4. 仅改写标识符：数字、单位、函数调用与不确定度取值保持原样 ----------
+    new_expression, _ = _apply_edits(expression, scanned[0][2])
+    new_variables: dict[str, str] = {}
+    new_uncertainties: dict[str, str] = {}
+    for source, src, edits, _ in scanned[1:]:
+        rewritten, _ = _apply_edits(src, edits)
+        if source.startswith("var:"):
+            old_name = source[len("var:"):]
+            new_variables[final_names[old_name]] = rewritten
+        else:
+            old_name = source[len("uncert:"):]
+            new_uncertainties[final_names[old_name]] = src  # 取值不动，仅键迁移
+
+    # ---- 5. 改名后重新校验（语义等价校验；失败同样不产出可用结果） ------------
+    after = analyze(new_expression, new_variables, None, new_uncertainties)
+    if not after["ok"]:
+        for err in after["errors"]:
+            err["stage"] = "after_rename"
+        return {"ok": False, "errors": after["errors"],
+                "warnings": after["warnings"], "result": None}
+
+    return {
+        "ok": True,
+        "errors": [],
+        "warnings": after["warnings"],
+        "result": {
+            "expression": new_expression,
+            "variables": new_variables,
+            "uncertainties": new_uncertainties,
+            "renames": [{"old": old, "new": mapping[old]} for old in renames],
+            "check": after,
+        },
+    }

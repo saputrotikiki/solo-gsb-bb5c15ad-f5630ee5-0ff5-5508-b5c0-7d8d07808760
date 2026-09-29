@@ -231,3 +231,70 @@ def test_solve_missing_field_is_http_422():
     })
     assert r.status_code == 422
 
+
+# ---------------- 改名 /api/rename ----------------
+
+def test_rename_preview_ok():
+    r = client.post("/api/rename", json={
+        "expression": "0.5*mass*v^2 + mass*g0*h0",
+        "variables": {"mass": "2 kg", "v": "10 m/s", "h0": "5 m"},
+        "uncertainties": {"mass": "0.01 kg", "v": "0.1 m/s"},
+        "renames": {"mass": "M", "v": "vel"},
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    res = data["result"]
+    assert res["expression"] == "0.5*M*vel^2 + M*g0*h0"
+    assert res["variables"] == {"M": "2 kg", "vel": "10 m/s", "h0": "5 m"}
+    assert res["uncertainties"] == {"M": "0.01 kg", "vel": "0.1 m/s"}
+    assert res["renames"] == [{"old": "mass", "new": "M"},
+                              {"old": "v", "new": "vel"}]
+    assert res["check"]["ok"] is True
+    assert res["check"]["result"]["si_value"] == pytest.approx(198.0665)
+
+
+def test_rename_swap_names_via_http():
+    r = client.post("/api/rename", json={
+        "expression": "a*b", "variables": {"a": "2", "b": "3"},
+        "renames": {"a": "b", "b": "a"},
+    })
+    data = r.json()
+    assert data["ok"] is True, data["errors"]
+    assert data["result"]["expression"] == "b*a"
+    assert data["result"]["variables"] == {"b": "2", "a": "3"}
+
+
+def test_rename_shadow_conflict_rejected_via_http():
+    r = client.post("/api/rename", json={
+        "expression": "x*g0", "variables": {"x": "1 kg"},
+        "renames": {"x": "g0"},
+    })
+    data = r.json()
+    assert data["ok"] is False
+    assert data["result"] is None
+    err = data["errors"][0]
+    assert err["kind"] == "rename_shadow"
+    assert err["source"] == "expression"
+    assert err["shadowed"] == "g0"
+    # 错误位置可在改写后串中定位
+    assert "g0*g0"[err["start"]:err["end"]] == "g0"
+
+
+def test_rename_invalid_recipe_reports_before_stage():
+    r = client.post("/api/rename", json={
+        "expression": "1 m + 1 s", "variables": {}, "renames": {},
+    })
+    data = r.json()
+    assert data["ok"] is False
+    assert data["result"] is None
+    assert data["errors"][0]["kind"] == "dim_mismatch"
+    assert data["errors"][0]["stage"] == "before_rename"
+
+
+def test_rename_missing_renames_field_is_http_422():
+    r = client.post("/api/rename", json={
+        "expression": "x", "variables": {"x": "1 m"},
+    })
+    assert r.status_code == 422
+

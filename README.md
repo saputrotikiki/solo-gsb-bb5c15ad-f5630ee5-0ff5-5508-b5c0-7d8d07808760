@@ -1,6 +1,6 @@
 # ⚗️ 科研配方量纲校验台（dimcheck）
 
-录入**带单位的计算表达式**与变量取值，系统解析括号、幂运算与函数调用，**递归推导量纲**并自动完成单位换算；对**相加异量纲**、**非法幂指数**、**未定义变量**等错误，给出**指向表达式具体片段**的定位信息，并展示 SI 换算结果。可为直接测量输入填写**带单位的标准不确定度**，系统以各独立输入为扰动源做双侧小步长重算，按**一阶平方和（RSS）**给出结果的**合成标准不确定度**，标称值与不确定度随目标单位一起换算。还可指定一个直接输入变量、取值单位、上下界与**带单位的目标结果**，系统覆盖该变量重算下游变量链，以**二分法反求**使主表达式达到目标的变量值。支持校验案例的**保存 / 加载 / 删除**与 **JSON 导出**。
+录入**带单位的计算表达式**与变量取值，系统解析括号、幂运算与函数调用，**递归推导量纲**并自动完成单位换算；对**相加异量纲**、**非法幂指数**、**未定义变量**等错误，给出**指向表达式具体片段**的定位信息，并展示 SI 换算结果。可为直接测量输入填写**带单位的标准不确定度**，系统以各独立输入为扰动源做双侧小步长重算，按**一阶平方和（RSS）**给出结果的**合成标准不确定度**，标称值与不确定度随目标单位一起换算。还可指定一个直接输入变量、取值单位、上下界与**带单位的目标结果**，系统覆盖该变量重算下游变量链，以**二分法反求**使主表达式达到目标的变量值。整理已有配方时可提交一组**「旧名→新名」改名映射**（允许两变量交换名称），系统只改写指向用户变量的标识符、保持内置单位 / 常量 / 函数调用原义，预览改名后的完整配方并重新校验。支持校验案例的**保存 / 加载 / 删除**与 **JSON 导出**。
 
 技术栈：Python 3.11+ · FastAPI · SQLite · 原生 HTML/JS/CSS（无前端构建）。
 
@@ -216,11 +216,106 @@ curl -s http://localhost:8000/api/solve -H 'Content-Type: application/json' -d '
 
 ---
 
+## 变量改名预览
+
+整理现有配方时，可提交主表达式、变量定义、各直接输入的不确定度与一组**「旧名→新名」映射**，系统返回改名后的完整配方（表达式、变量定义、不确定度键、旧新名称对照）以及改名后配方的完整校验结果。改名只做标识符级文本改写，**数字、单位、函数调用与不确定度取值一字不动**。
+
+**改名规则**：
+
+- 映射**按原名称同时生效**——先解析再统一替换，因此允许两个变量交换名称（`{"a": "b", "b": "a"}`），不会发生链式覆盖；只提交部分变量时，未列入映射的变量保持原名；
+- **旧名必须存在**（`rename_missing_old`），新名必须符合现有变量标识符规则：以字母或 `_` 起始，只含字母、数字与下划线（`rename_bad_new`）；
+- 改名后变量名**不得重复**（`rename_duplicate`，包括把 A 改成某个未改名变量 B 的名字）；
+- 主表达式与各变量定义中**指向用户变量的引用随之改写**（含间接变量链，如 `F = mass*g0` 中的 `mass`）；
+- **内置单位、内置常量与函数调用的同名文本保持原含义**：`m`、`g0`、`sqrt(...)` 等不会被改写。
+
+**内置名称遮蔽保护**：若某个新变量名与配方中**未改写的**内置单位 / 常量同名，改名将使该处静默改按变量解析（名称解析顺序为用户变量 > 内置常量 > 内置单位），系统**拒绝整次改名**（`rename_shadow`），错误定位到改写后串中的冲突片段（`source` 为 `expression` / `var:<名称>` / `uncert:<名称>`，并带 `shadowed` 与 `builtin_kind`（`unit` / `constant`）字段），**不输出任何部分配方**。新名虽然与内置单位同名、但配方中并不存在该内置名称引用时允许改名，仅按现有口径给出 `shadow_unit` / `shadow_constant` 警告。函数名不在遮蔽保护范围内（`sqrt(...)` 调用语法永远先按函数解析）。
+
+**不确定度迁移**：不确定度表达式文本原样保留，仅其**键随变量名迁移**（`mass` 的不确定度改名后挂在新名之下）；不确定度表达式中的单位文本同样受遮蔽保护。
+
+**前后两次校验**：改名前先对原配方做一次完整校验，原配方无效时直接返回原错误（错误项带 `stage: "before_rename"`，`source` 仍指向原始来源），不做改名；改名后再对新配方完整校验（含量纲、不确定度、间接变量规则），理论上改名保持语义等价，若仍失败则错误带 `stage: "after_rename"`，同样不产生可用结果（`result` 为 `null`）。现有 `/api/check`、`/api/solve` 与案例接口不受影响。
+
+请求示例（同时改名两个变量，其中 `g0` 是内置常量但仅出现在被改写引用之外）：
+
+```bash
+curl -s http://localhost:8000/api/rename -H 'Content-Type: application/json' -d '{
+  "expression": "0.5*mass*v^2 + mass*g0*h0",
+  "variables": {"mass": "2 kg", "v": "10 m/s", "h0": "5 m"},
+  "uncertainties": {"mass": "0.01 kg", "v": "0.1 m/s"},
+  "renames": {"mass": "M", "v": "vel"}
+}'
+```
+
+响应（`result.check` 即改名后配方的完整 `/api/check` 同构结果）：
+
+```json
+{
+  "ok": true,
+  "errors": [],
+  "warnings": [],
+  "result": {
+    "expression": "0.5*M*vel^2 + M*g0*h0",
+    "variables": {"M": "2 kg", "vel": "10 m/s", "h0": "5 m"},
+    "uncertainties": {"M": "0.01 kg", "vel": "0.1 m/s"},
+    "renames": [{"old": "mass", "new": "M"}, {"old": "v", "new": "vel"}],
+    "check": { "ok": true, "errors": [], "warnings": [], "result": { "...": "与 /api/check 相同" } }
+  }
+}
+```
+
+交换名称示例（`a`、`b` 互换；引用按原名同时改写）：
+
+```bash
+curl -s http://localhost:8000/api/rename -H 'Content-Type: application/json' -d '{
+  "expression": "a*b",
+  "variables": {"a": "2", "b": "3"},
+  "renames": {"a": "b", "b": "a"}
+}'
+# expression -> "b*a"，variables -> {"b": "2", "a": "3"}
+```
+
+遮蔽冲突示例（新名 `g0` 会让主表达式里未改写的内置常量 `g0` 被变量遮蔽，整次拒绝）：
+
+```bash
+curl -s http://localhost:8000/api/rename -H 'Content-Type: application/json' -d '{
+  "expression": "x*g0",
+  "variables": {"x": "1 kg"},
+  "renames": {"x": "g0"}
+}'
+```
+
+```json
+{
+  "ok": false,
+  "errors": [{
+    "message": "主表达式中的内置常量「g0」会被改名后的同名变量遮蔽，该处本应指向内置常量，改名将改变配方含义；请更换新变量名",
+    "start": 3, "end": 5,
+    "kind": "rename_shadow",
+    "source": "expression",
+    "shadowed": "g0",
+    "builtin_kind": "constant"
+  }],
+  "warnings": [],
+  "result": null
+}
+```
+
+`POST /api/rename` 请求体字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `expression` | string | 主表达式（与 `/api/check` 相同） |
+| `variables` | object | 变量名 → 带单位取值表达式 |
+| `uncertainties` | object | 变量名 → 带单位的标准不确定度（可空 / 省略） |
+| `renames` | object | **旧变量名 → 新变量名**映射（必填，可为空对象 `{}`，空映射返回原配方预览） |
+
+---
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/check` | 校验表达式，返回量纲、SI 数值、目标单位换算、合成标准不确定度、错误/警告 |
+| POST | `/api/rename` | 变量改名预览：按「旧名→新名」映射整体改写配方（支持交换名称），返回改写后配方与改名后校验结果 |
 | POST | `/api/solve` | 反求直接输入变量：在给定区间内二分，使主表达式达到带单位的目标结果 |
 | GET | `/api/units` | 单位 / 常量 / 函数目录 |
 | POST | `/api/cases` | 保存校验案例（含 `uncertainties`） |
@@ -302,7 +397,7 @@ curl -s http://localhost:8000/api/check -H 'Content-Type: application/json' -d '
 }
 ```
 
-`start` / `end` 是原始表达式字符串中的字符区间（上例即片段 `"1 s"`），`source` 取值：`expression`（主表达式）、`var:<名称>`（某变量的定义式）、`uncert:<名称>`（某变量的不确定度输入）、`target`（目标单位）。前端据此将出错片段高亮标红。
+`start` / `end` 是原始表达式字符串中的字符区间（上例即片段 `"1 s"`），`source` 取值：`expression`（主表达式）、`var:<名称>`（某变量的定义式）、`uncert:<名称>`（某变量的不确定度输入）、`target`（目标单位）、`rename:<旧名>`（改名映射自身的问题）。前端据此将出错片段高亮标红。改名接口的错误项另带 `stage`（`before_rename` / `after_rename`）标明来自改名前还是改名后的校验，遮蔽冲突的片段位置相对于改写后的字符串。
 
 ### 错误类型（`kind`）
 
@@ -332,6 +427,10 @@ curl -s http://localhost:8000/api/check -H 'Content-Type: application/json' -d '
 | `solve_no_bracket` | 区间两端残差同号，不包含达到目标的解 |
 | `solve_max_iter` | 二分 80 次仍未达到收敛容差 |
 | `solve_eval_failed` | 反求试算失败（量纲 / 定义域 / 非有限值等；错误项保留内部 `kind` 并带试算上下文字段） |
+| `rename_missing_old` | 改名映射中的旧名不是当前配方已定义的变量（`source` 为 `rename:<旧名>`） |
+| `rename_bad_new` | 新名称不符合变量标识符规则（字母 / `_` 起始，只含字母数字下划线） |
+| `rename_duplicate` | 改名后变量名重复（含与未改名变量撞名） |
+| `rename_shadow` | 新变量名会遮蔽未改写的内置单位 / 常量引用（带 `shadowed`、`builtin_kind`，定位到冲突片段），整次改名被拒绝 |
 
 扰动类错误（`uncert_eval` 及扰动中暴露的 `value` 等）还带有 `perturbed`（扰动来源变量名）与 `direction`（`+` / `-`，表示正/负向步长）字段，其 `source` 指向真正出错的表达式（主表达式或 `var:<名称>`）；不确定度输入自身的错误 `source` 为 `uncert:<名称>`。
 
@@ -355,12 +454,12 @@ curl -OJ http://localhost:8000/api/export
 
 ```
 ├── app/
-│   ├── main.py        # FastAPI 应用：API 路由 + 静态页面
-│   ├── engine.py      # 引擎：词法分析 → 递归下降解析 → 量纲/数值求值、双侧扰动 RSS 不确定度、二分反求
+│   ├── main.py        # FastAPI 应用：API 路由（check / rename / solve / 案例）+ 静态页面
+│   ├── engine.py      # 引擎：词法分析 → 递归下降解析 → 量纲/数值求值、双侧扰动 RSS 不确定度、二分反求、变量改名
 │   ├── units.py       # 单位 / 常量 / 函数注册表，量纲格式化
 │   ├── db.py          # SQLite 案例存储（含 uncertainties 列，旧库自动迁移）
 │   └── static/        # 原生前端（index.html / app.js / style.css）
-├── tests/             # pytest：引擎单元测试（含 test_uncertainty.py / test_solve.py）+ API 集成测试
+├── tests/             # pytest：引擎单元测试（含 test_uncertainty.py / test_solve.py / test_rename.py）+ API 集成测试
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt       # 运行依赖（fastapi / uvicorn）
