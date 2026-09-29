@@ -1168,3 +1168,168 @@ def solve_inverse(expression: str, variables: dict | None, solve_for: str,
         f"二分 {SOLVE_MAX_ITERATIONS} 次后仍未达到收敛容差（SI 残差须 ≤ {tol:g}）",
         0, max(len(solve_unit), 1), "solve_max_iter",
     )
+
+
+# ---------------------------------------------------------------------------
+# 变量改名预览：按“旧名 → 新名”映射同时改写配方中的变量引用
+# ---------------------------------------------------------------------------
+
+def _is_valid_identifier(name: str) -> bool:
+    """能否作为变量标识符：按现有词法规则，整体恰好是一个 ident 词法单元。"""
+    if not name:
+        return False
+    try:
+        toks = tokenize(name)
+    except EngineError:
+        return False
+    return (len(toks) == 2 and toks[0].kind == "ident"
+            and toks[0].start == 0 and toks[0].end == len(name))
+
+
+def _name_nodes(node: Node):
+    """遍历 AST 中全部“名称引用”节点（函数调用的函数名不在其列）。"""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.kind == "name":
+            yield n
+        if n.left is not None:
+            stack.append(n.left)
+        if n.right is not None:
+            stack.append(n.right)
+        stack.extend(n.args)
+
+
+def _apply_edits(src: str, edits: list[tuple[int, int, str]]) -> str:
+    """按 (start, end, text) 从后往前替换标识符片段，其余字符原样保留。"""
+    for start, end, text in sorted(edits, reverse=True):
+        src = src[:start] + text + src[end:]
+    return src
+
+
+def rename_recipe(expression: str, variables: dict | None,
+                  uncertainties: dict | None, renames: dict | None) -> dict:
+    """按“旧名 → 新名”映射同时改写配方，预览改名后的完整配方。
+
+    映射按原名称同时生效（允许两变量交换名称）；主表达式与变量定义中原本
+    指向用户变量的引用随之改写，原本指向内置单位/常量的同名文本保持原含义；
+    不确定度键随变量名迁移，取值不变。只改写标识符，不改动数字、单位、
+    函数调用及不确定度取值。
+
+    改名前配方无效、映射结构非法（旧名不存在 / 新名不是合法标识符 / 变更后
+    重名）、新名遮蔽未改写的内置引用、或改名后校验失败时，返回 ok=False 且
+    result 为 None——绝不输出部分配方。
+    """
+    expression = expression or ""
+    variables = {
+        str(k).strip(): (v if isinstance(v, str) else str(v))
+        for k, v in (variables or {}).items() if str(k).strip()
+    }
+    uncertainties = {
+        str(k).strip(): (v if isinstance(v, str) else str(v)).strip()
+        for k, v in (uncertainties or {}).items()
+        if str(k).strip() and (v if isinstance(v, str) else str(v)).strip()
+    }
+    mapping: dict[str, str] = {}
+    for k, v in (renames or {}).items():
+        old = str(k).strip()
+        if old:
+            mapping[old] = str(v).strip()
+
+    errors: list[AnalysisError] = []
+
+    def fail() -> dict:
+        return {"ok": False, "errors": [e.to_dict() for e in errors],
+                "warnings": [], "result": None}
+
+    # ---- 1. 映射结构校验：旧名存在、新名合法、变更后不重名 -------------------
+    for old in mapping:
+        if old not in variables:
+            errors.append(AnalysisError(
+                f"改名映射的旧名「{old}」不存在于变量列表",
+                0, max(len(old), 1), "rename_unknown", "rename"))
+    for old, new in mapping.items():
+        if not new:
+            errors.append(AnalysisError(
+                f"变量「{old}」的新名不能为空",
+                0, max(len(old), 1), "rename_ident", "rename"))
+        elif not _is_valid_identifier(new):
+            errors.append(AnalysisError(
+                f"新名「{new}」不是合法的变量标识符",
+                0, max(len(new), 1), "rename_ident", "rename"))
+        elif new in FUNCTIONS:
+            # 变量名与函数同名时，「名(」会被解析成函数调用，文本替换会改变语义
+            errors.append(AnalysisError(
+                f"新名「{new}」与内置函数同名，不能作为改名目标",
+                0, max(len(new), 1), "rename_ident", "rename"))
+    if not errors:
+        # 映射按原名称同时生效：交换名称（a→b 且 b→a）合法；
+        # 只有变更后的名称集合出现重复才报错
+        seen: dict[str, list[str]] = {}
+        for old_key in variables:
+            seen.setdefault(mapping.get(old_key, old_key), []).append(old_key)
+        for new, olds in seen.items():
+            if len(olds) > 1:
+                errors.append(AnalysisError(
+                    f"改名后变量名「{new}」重复（来自 {'、'.join(olds)}）",
+                    0, max(len(new), 1), "rename_duplicate", "rename"))
+    if errors:
+        return fail()
+
+    # ---- 2. 改名前校验：原配方（表达式 + 变量 + 不确定度）必须整体有效 --------
+    pre = analyze(expression, variables, None, uncertainties)
+    if not pre["ok"]:
+        return {"ok": False, "errors": pre["errors"],
+                "warnings": pre["warnings"], "result": None}
+
+    # ---- 3. 逐表达式改写：用户变量引用随映射改写；内置单位/常量引用保持原样 ---
+    new_names = set(mapping.values())
+    conflicts: list[AnalysisError] = []
+
+    def rewrite(src: str, source: str) -> str:
+        ast = parse_src(src)  # 改名前校验已通过，此处必然可解析
+        edits: list[tuple[int, int, str]] = []
+        for node in _name_nodes(ast):
+            name = node.name
+            if name in variables:
+                # 原本指向用户变量（变量优先于单位/常量解析）→ 随映射改写
+                if name in mapping:
+                    edits.append((node.start, node.end, mapping[name]))
+            elif (name in UNITS or name in CONSTANTS) and name in new_names:
+                # 原本指向内置单位/常量、保持原样的文本，会被新变量名遮蔽
+                what = "内置单位" if name in UNITS else "内置常量"
+                conflicts.append(AnalysisError(
+                    f"新变量名「{name}」会遮蔽此处对{what}「{name}」的引用，"
+                    "整次改名被拒绝",
+                    node.start, node.end, "rename_shadow", source))
+        return _apply_edits(src, edits)
+
+    renamed_expression = rewrite(expression, "expression")
+    renamed_variables: dict[str, str] = {}
+    for name, src in variables.items():
+        renamed_variables[mapping.get(name, name)] = rewrite(src, f"var:{name}")
+
+    if conflicts:
+        errors.extend(conflicts)
+        return fail()
+
+    # 不确定度键随变量名迁移，取值原样保留
+    renamed_uncertainties = {mapping.get(k, k): v for k, v in uncertainties.items()}
+
+    # ---- 4. 改名后校验：改写结果必须仍整体有效 --------------------------------
+    post = analyze(renamed_expression, renamed_variables, None, renamed_uncertainties)
+    if not post["ok"]:
+        return {"ok": False, "errors": post["errors"],
+                "warnings": post["warnings"], "result": None}
+
+    return {
+        "ok": True,
+        "errors": [],
+        "warnings": post["warnings"],
+        "result": {
+            "expression": renamed_expression,
+            "variables": renamed_variables,
+            "uncertainties": renamed_uncertainties,
+            "renames": dict(mapping),
+        },
+    }
